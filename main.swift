@@ -293,7 +293,7 @@ private struct TaskProgress {
     let currentStep: String?
 
     var elapsed: TimeInterval {
-        guard let start = startedAt else { return 0 }
+        let start = startedAt ?? lastActivity
         let end = finishedAt ?? Date()
         return max(0, end.timeIntervalSince(start))
     }
@@ -405,6 +405,7 @@ private final class TaskReader {
         var latestUserText: String?
         var latestUserDate: Date?
         var latestActivity = modifiedAt
+        var firstEventDate: Date?
         var latestEvent = "读取日志"
         var latestDetail: String?
         var latestStart: Date?
@@ -420,6 +421,7 @@ private final class TaskReader {
                 continue
             }
             let date = (object["timestamp"] as? String).flatMap(parseDate) ?? modifiedAt
+            if firstEventDate == nil { firstEventDate = date }
             if date > latestActivity { latestActivity = date }
 
             let objectType = object["type"] as? String ?? ""
@@ -524,6 +526,14 @@ private final class TaskReader {
             status = Date().timeIntervalSince(latestActivity) < 15 * 60 ? .waiting : .idle
         }
 
+        let isActive = status == .running || status == .waiting
+        let effectiveStart: Date
+        if status == .waiting {
+            effectiveStart = latestUserDate ?? latestStart ?? firstUserDate ?? firstEventDate ?? latestActivity
+        } else {
+            effectiveStart = latestStart ?? firstUserDate ?? firstEventDate ?? latestActivity
+        }
+        let effectiveFinish = isActive ? nil : terminalDate
         let indexedTitle = threadNames[sessionID] ?? (parentThreadID.flatMap { threadNames[$0] })
         let title = cleanTitle(indexedTitle ?? latestUserText ?? firstUserText ?? "未命名任务")
         let project = cwd.isEmpty ? "当前工作区" : URL(fileURLWithPath: cwd).lastPathComponent
@@ -534,8 +544,8 @@ private final class TaskReader {
             cwd: cwd,
             status: status,
             lastActivity: latestActivity,
-            startedAt: latestStart ?? firstUserDate,
-            finishedAt: terminalDate,
+            startedAt: effectiveStart,
+            finishedAt: effectiveFinish,
             lastEvent: latestEvent,
             detail: planCounts?.current ?? latestDetail ?? latestEvent,
             model: latestModel,
@@ -657,6 +667,14 @@ private final class TaskReader {
             status = cached.status
         }
 
+        let isActive = status == .running || status == .waiting
+        let effectiveStart: Date
+        if status == .waiting {
+            effectiveStart = latestUserDate ?? latestStart ?? latestActivity
+        } else {
+            effectiveStart = latestStart ?? latestActivity
+        }
+        let effectiveFinish = isActive ? nil : latestTerminal
         return TaskProgress(
             id: cached.id,
             title: threadNames[cached.id] ?? cached.title,
@@ -664,8 +682,8 @@ private final class TaskReader {
             cwd: cached.cwd,
             status: status,
             lastActivity: latestActivity,
-            startedAt: latestStart,
-            finishedAt: latestTerminal,
+            startedAt: effectiveStart,
+            finishedAt: effectiveFinish,
             lastEvent: latestEvent,
             detail: planCounts?.current ?? latestDetail,
             model: latestModel,
@@ -1008,14 +1026,20 @@ private final class TaskPanelView: NSView {
         ]
         drawText(task.title, in: NSRect(x: 22, y: y - 1, width: bounds.width - 30, height: 13), attributes: titleAttributes)
 
+        let isActive = task.status == .running || task.status == .waiting
         var detail = task.detail
-        if task.status != .running && task.status != .waiting {
+        if !isActive {
             detail = "\(task.status.displayName) · \(detail)"
+        }
+        if isActive {
+            detail = "已处理\(formatActiveElapsed(task.elapsed)) · \(detail)"
         }
         if let completed = task.completedSteps, let total = task.totalSteps, total > 0 {
             detail += " · \(completed)/\(total)"
         }
-        detail += " · \(formatElapsed(task.elapsed))"
+        if !isActive {
+            detail += " · \(formatElapsed(task.elapsed))"
+        }
         let detailAttributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 8),
             .foregroundColor: NSColor.secondaryLabelColor
@@ -1063,6 +1087,13 @@ private final class TaskPanelView: NSView {
         if seconds < 3600 { return "\(seconds / 60)分" }
         return "\(seconds / 3600)时\(seconds % 3600 / 60)分"
     }
+
+    private func formatActiveElapsed(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval.rounded()))
+        if seconds < 60 { return "\(seconds)秒" }
+        if seconds < 3600 { return "\(seconds / 60)分\(seconds % 60)秒" }
+        return "\(seconds / 3600)时\(seconds % 3600 / 60)分\(seconds % 60)秒"
+    }
 }
 
 private final class TaskDetailView: NSView {
@@ -1105,14 +1136,20 @@ private final class TaskDetailView: NSView {
             ]
             drawText(task.title, in: NSRect(x: 29, y: y + 2, width: bounds.width - 43, height: 15), attributes: titleAttributes)
 
+            let isActive = task.status == .running || task.status == .waiting
             var detail = task.detail
-            if task.status != .running && task.status != .waiting {
+            if !isActive {
                 detail = "\(task.status.displayName) · \(detail)"
+            }
+            if isActive {
+                detail = "已处理\(formatActiveElapsed(task.elapsed)) · \(detail)"
             }
             if let completed = task.completedSteps, let total = task.totalSteps, total > 0 {
                 detail += " · \(completed)/\(total)"
             }
-            detail += " · \(formatElapsed(task.elapsed))"
+            if !isActive {
+                detail += " · \(formatElapsed(task.elapsed))"
+            }
             let detailAttributes: [NSAttributedString.Key: Any] = [
                 .font: NSFont.systemFont(ofSize: 9),
                 .foregroundColor: NSColor.secondaryLabelColor
@@ -1154,6 +1191,13 @@ private final class TaskDetailView: NSView {
         if seconds < 60 { return "\(seconds)秒" }
         if seconds < 3600 { return "\(seconds / 60)分" }
         return "\(seconds / 3600)时\(seconds % 3600 / 60)分"
+    }
+
+    private func formatActiveElapsed(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval.rounded()))
+        if seconds < 60 { return "\(seconds)秒" }
+        if seconds < 3600 { return "\(seconds / 60)分\(seconds % 60)秒" }
+        return "\(seconds / 3600)时\(seconds % 3600 / 60)分\(seconds % 60)秒"
     }
 }
 
@@ -1212,6 +1256,10 @@ private final class TaskDetailWindowController: NSWindowController, NSWindowDele
         // window unexpectedly stretch across the desktop.
         detailView.setFrameSize(NSSize(width: windowWidth, height: contentHeight))
         window?.setContentSize(NSSize(width: windowWidth, height: visibleHeight))
+    }
+
+    func refreshElapsed() {
+        detailView.needsDisplay = true
     }
 
     func show(relativeTo parent: NSWindow?) {
@@ -1335,6 +1383,13 @@ private final class TaskPanelController: NSWindowController {
         updateDetailWindow(named: "已完成", tasks: Array(finished.dropFirst()))
     }
 
+    func refreshElapsed() {
+        taskView.needsDisplay = true
+        for controller in detailWindows.values {
+            controller.refreshElapsed()
+        }
+    }
+
     func showPanel() {
         window?.orderFrontRegardless()
     }
@@ -1386,6 +1441,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var refreshTimer: Timer!
     private var taskRefreshTimer: Timer!
+    private var elapsedRefreshTimer: Timer!
     private var latestSnapshot = UsageSnapshot.empty
     private var latestTasks: [TaskProgress] = []
     private var taskPanel: TaskPanelController!
@@ -1409,6 +1465,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         taskRefreshTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             self?.refreshTasks()
+        }
+        elapsedRefreshTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.taskPanel.refreshElapsed()
         }
     }
 
