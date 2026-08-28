@@ -13,7 +13,7 @@
 ## 构建与运行
 
 ```bash
-./build-app.sh
+bash build-app.sh
 open CodexTaskProgress.app
 ```
 
