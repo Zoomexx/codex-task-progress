@@ -1,6 +1,7 @@
 import Cocoa
 import Foundation
 import Darwin
+import QuartzCore
 
 // Shared by both monitor bundles so starting the legacy copy cannot create a
 // second status item or task-progress window.
@@ -1257,6 +1258,109 @@ private final class TaskReader {
     }
 }
 
+/// A deliberately quiet activity cue for the otherwise unused lower part of
+/// the task card. It uses one moving layer, never changes the panel geometry,
+/// and becomes a still indicator when the user has enabled Reduce Motion.
+private final class TaskActivityView: NSView {
+    private let movingLayer = CALayer()
+    private var shouldAnimate = false
+    private var accentColor = TaskStatus.running.color
+    private let movingWidth: CGFloat = 34
+    private var configuredSize = CGSize.zero
+    private var configuredActive = false
+    private var configuredColor: NSColor?
+    private var configuredReduceMotion: Bool?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        movingLayer.cornerRadius = 1.5
+        movingLayer.actions = [
+            "position": NSNull(),
+            "bounds": NSNull(),
+            "opacity": NSNull(),
+            "backgroundColor": NSNull()
+        ]
+        layer?.addSublayer(movingLayer)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(active: Bool, color: NSColor) {
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let stateChanged = active != configuredActive
+            || configuredColor?.isEqual(color) != true
+            || configuredReduceMotion != reduceMotion
+            || configuredSize != bounds.size
+        shouldAnimate = active
+        accentColor = color
+        isHidden = !active
+        needsDisplay = true
+        if stateChanged {
+            configureLayer(reduceMotion: reduceMotion)
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if configuredSize != bounds.size || configuredActive != shouldAnimate || configuredReduceMotion != reduceMotion {
+            configureLayer(reduceMotion: reduceMotion)
+        } else if shouldAnimate {
+            // A parent resize can move this view without changing its size.
+            // Keep the presentation layer in the new local coordinate space
+            // without removing the long-lived travel animation.
+            movingLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+        }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard shouldAnimate, bounds.width > movingWidth else { return }
+        let trackRect = NSRect(
+            x: 0,
+            y: max(0, (bounds.height - 2) / 2),
+            width: bounds.width,
+            height: 2
+        )
+        accentColor.withAlphaComponent(0.16).setFill()
+        NSBezierPath(roundedRect: trackRect, xRadius: 1, yRadius: 1).fill()
+    }
+
+    private func configureLayer(reduceMotion: Bool) {
+        movingLayer.removeAllAnimations()
+        configuredSize = bounds.size
+        configuredActive = shouldAnimate
+        configuredColor = accentColor
+        configuredReduceMotion = reduceMotion
+        guard shouldAnimate, bounds.width > movingWidth else {
+            movingLayer.opacity = 0
+            return
+        }
+
+        movingLayer.backgroundColor = accentColor.withAlphaComponent(0.72).cgColor
+        movingLayer.bounds = NSRect(x: 0, y: 0, width: movingWidth, height: 3)
+        movingLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
+
+        if reduceMotion {
+            movingLayer.opacity = 0.58
+            return
+        }
+
+        movingLayer.opacity = 1
+        let travel = max(0, (bounds.width - movingWidth) / 2)
+        let animation = CABasicAnimation(keyPath: "transform.translation.x")
+        animation.fromValue = -travel
+        animation.toValue = travel
+        animation.duration = 1.6
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        movingLayer.add(animation, forKey: "task-activity-travel")
+    }
+}
+
 private final class TaskPanelView: NSView {
     private struct HitRow {
         let frame: NSRect
@@ -1268,6 +1372,7 @@ private final class TaskPanelView: NSView {
     var tasks: [TaskProgress] = [] {
         didSet {
             resizeForContent()
+            updateActivityView()
             needsDisplay = true
         }
     }
@@ -1284,6 +1389,22 @@ private final class TaskPanelView: NSView {
     private let sectionBottomSpacing: CGFloat = 7
     private let approvalBannerHeight: CGFloat = 36
     private let headerHeight: CGFloat = 46
+    private let activityView: TaskActivityView
+
+    override init(frame frameRect: NSRect) {
+        activityView = TaskActivityView(frame: .zero)
+        super.init(frame: frameRect)
+        addSubview(activityView)
+        updateActivityView()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layout() {
+        super.layout()
+        updateActivityView()
+    }
 
     var preferredHeight: CGFloat {
         let active = tasks.filter { $0.status == .running || $0.status == .waiting }
@@ -1368,6 +1489,39 @@ private final class TaskPanelView: NSView {
         NSColor.separatorColor.withAlphaComponent(0.42).setStroke()
         background.lineWidth = 1
         background.stroke()
+    }
+
+    private func updateActivityView() {
+        let activeTasks = sortedTasks(statuses: [.running, .waiting])
+        // The section renderer adds a small trailing gap after the last row.
+        // Start the centering calculation at the row's actual lower edge so
+        // the indicator sits in the visual middle of the remaining whitespace
+        // instead of drifting toward the card's bottom border.
+        let contentBottom = max(0, estimatedContentBottom() - sectionBottomSpacing)
+        let available = bounds.height - contentBottom
+        let activityHeight: CGFloat = 16
+        let hasSpace = available >= activityHeight + 8
+        let active = !activeTasks.isEmpty && hasSpace
+        let y = contentBottom + max(0, (available - activityHeight) / 2)
+        activityView.frame = NSRect(
+            x: 34,
+            y: y,
+            width: max(0, bounds.width - 68),
+            height: activityHeight
+        )
+        activityView.update(active: active, color: activeTasks.first?.status.color ?? TaskStatus.running.color)
+    }
+
+    private func estimatedContentBottom() -> CGFloat {
+        var height = headerHeight
+        if tasks.contains(where: \.needsApproval) {
+            height += 6 + approvalBannerHeight
+        }
+        // drawSection always renders one row (or one empty row), followed by
+        // the same compact bottom spacing. Keep the animation below that
+        // content instead of placing it over a task detail line.
+        height += 2 * (sectionHeaderHeight + rowHeight + sectionBottomSpacing)
+        return height
     }
 
     override func mouseDown(with event: NSEvent) {
