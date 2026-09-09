@@ -307,19 +307,33 @@ private final class TaskReader {
         if let cached = cache[url.path],
            fileSize >= cached.fileSize,
            cached.fileSize >= 1_048_576 {
+            // A long-running task can append several megabytes after its
+            // task_started event. Re-reading only the newest 1 MB then misses
+            // that boundary and leaves a previously completed row marked as
+            // completed. The cached file size is the exact read offset, so
+            // consume only newly appended bytes and preserve the cached state
+            // for everything before that offset.
+            let data: Data
+            if fileSize > cached.fileSize {
+                data = (readIncrementalData(from: url, offset: cached.fileSize)
+                    ?? readTailData(from: url, maxBytes: 1_048_576)) ?? Data()
+            } else {
+                data = readTailData(from: url, maxBytes: 1_048_576) ?? Data()
+            }
             let task = taskFromTail(
                 url: url,
                 modifiedAt: modifiedAt,
-                cached: cached.task
+                cached: cached.task,
+                data: data
             )
             cache[url.path] = CachedTask(modifiedAt: modifiedAt, fileSize: fileSize, task: task)
             return task
         }
         // A cold start must not read the entire multi-hundred-megabyte session
         // archive before the widget can show anything. Read a small metadata
-        // prefix and the newest tail for large logs; the same tail parser is
-        // then used for incremental refreshes. Small logs retain the exact
-        // full-parse path below.
+        // prefix and the newest tail for large logs on cold start; subsequent
+        // refreshes consume only bytes appended after the cached file offset.
+        // Small logs retain the exact full-parse path below.
         if fileSize >= 1_048_576 {
             guard let task = taskFromRecentTail(url: url, modifiedAt: modifiedAt, fileSize: fileSize) else {
                 return nil
@@ -548,7 +562,11 @@ private final class TaskReader {
             cwd: metadata.cwd,
             status: .idle,
             lastActivity: metadata.timestamp ?? modifiedAt,
-            startedAt: metadata.timestamp,
+            // The session metadata timestamp is the conversation's creation
+            // time, not the current task/turn boundary.  Keeping it here
+            // makes a long-lived session look like one task has been running
+            // for days when the tail does not contain task_started.
+            startedAt: nil,
             finishedAt: nil,
             lastEvent: "读取日志",
             detail: "读取日志",
@@ -621,6 +639,7 @@ private final class TaskReader {
         if cached.status == .completed { latestTerminalStatus = .completed }
         if cached.status == .interrupted { latestTerminalStatus = .interrupted }
         var latestUserDate: Date?
+        var latestWorkDate: Date?
         var latestModel = cached.model
         var tokenLedger = TaskTokenLedger(
             latestTotals: cached.tokenTotals,
@@ -631,6 +650,8 @@ private final class TaskReader {
         var planCounts: (completed: Int, total: Int, current: String?)?
         var pendingToolCalls: [String: PendingToolCall] = [:]
         var latestApprovalEvent: PendingToolCall?
+        var earliestWorkDate: Date?
+        var earliestUserDate: Date?
         if cached.needsApproval {
             latestApprovalEvent = PendingToolCall(
                 requestedAt: cached.approvalSince ?? cached.lastActivity,
@@ -665,7 +686,14 @@ private final class TaskReader {
                 }
                 switch payloadType {
                 case "task_started":
-                    latestStart = date
+                    // A tail read can overlap records from the previous turn.
+                    // Only a boundary newer than the cached terminal event may
+                    // replace the elapsed-time anchor.
+                    if cached.finishedAt == nil || date > cached.finishedAt! {
+                        if latestStart == nil || date >= latestStart! {
+                            latestStart = date
+                        }
+                    }
                     // Do not let an overlapping old task_started event reset
                     // the current task's token baseline. A newer start marks
                     // a new turn; the cached token event is the cutoff.
@@ -687,6 +715,8 @@ private final class TaskReader {
                     latestEvent = "任务中断"
                     latestDetail = "任务被中断"
                 case "item_completed":
+                    latestWorkDate = max(latestWorkDate ?? .distantPast, date)
+                    earliestWorkDate = min(earliestWorkDate ?? date, date)
                     if let item = payload["item"] as? [String: Any] {
                         let itemType = item["type"] as? String ?? ""
                         latestEvent = eventLabel(for: itemType)
@@ -697,6 +727,7 @@ private final class TaskReader {
                             let cleaned = cleanTitle(message)
                             if !cleaned.isEmpty && !isGenericTitle(cleaned) {
                                 latestUserDate = date
+                                earliestUserDate = min(earliestUserDate ?? date, date)
                             }
                         }
                         if let counts = findPlan(in: item) { planCounts = counts }
@@ -716,6 +747,8 @@ private final class TaskReader {
                 }
                 if let counts = findPlan(in: payload) { planCounts = counts }
             } else if objectType == "response_item", let payload = object["payload"] as? [String: Any] {
+                latestWorkDate = max(latestWorkDate ?? .distantPast, date)
+                earliestWorkDate = min(earliestWorkDate ?? date, date)
                 let payloadType = payload["type"] as? String ?? ""
                 latestEvent = eventLabel(for: payloadType)
                 if let detail = eventDetail(from: payload) {
@@ -726,6 +759,7 @@ private final class TaskReader {
                     let cleaned = cleanTitle(message)
                     if !cleaned.isEmpty && !isGenericTitle(cleaned) {
                         latestUserDate = date
+                        earliestUserDate = min(earliestUserDate ?? date, date)
                     }
                 }
                 if let counts = findPlan(in: payload) { planCounts = counts }
@@ -739,6 +773,16 @@ private final class TaskReader {
             status = .running
         } else if latestTerminalStatus == .interrupted {
             status = .interrupted
+        } else if let terminal = latestTerminal,
+                  let workDate = latestWorkDate,
+                  workDate > terminal,
+                  latestEvent != "任务完成",
+                  Date().timeIntervalSince(workDate) < 15 * 60 {
+            // If the task boundary itself fell outside the cached tail, a
+            // long log can still expose fresh response/item events after the
+            // previous terminal event. Treat that strictly newer work as an
+            // active task instead of showing a stale completed row.
+            status = .running
         } else if latestComplete != nil {
             status = .completed
         } else if let userDate = latestUserDate, userDate >= (latestTerminal ?? .distantPast) {
@@ -750,11 +794,29 @@ private final class TaskReader {
         }
 
         let isActive = status == .running || status == .waiting
+        // If the current task boundary was outside the cached tail, the first
+        // fresh user/work event after the cached terminal event is the safest
+        // per-task anchor.  Never fall back to the session creation time.
+        let inferredStart: Date? = {
+            guard let terminal = latestTerminal else { return nil }
+            let candidates = [earliestUserDate, earliestWorkDate]
+                .compactMap { $0 }
+                .filter { $0 > terminal }
+            return candidates.min()
+        }()
+        let needsInferredStart = isActive
+            && inferredStart != nil
+            && (latestStart == nil || (latestTerminal != nil && latestStart! <= latestTerminal!))
         let effectiveStart: Date
         if status == .waiting {
-            effectiveStart = latestUserDate ?? latestStart ?? latestActivity
+            effectiveStart = (needsInferredStart ? inferredStart : nil)
+                ?? latestUserDate
+                ?? latestStart
+                ?? latestActivity
         } else {
-            effectiveStart = latestStart ?? latestActivity
+            effectiveStart = (needsInferredStart ? inferredStart : nil)
+                ?? latestStart
+                ?? latestActivity
         }
         let effectiveFinish = isActive ? nil : latestTerminal
         let approval = isActive ? approvalState(
@@ -977,6 +1039,18 @@ private final class TaskReader {
         guard start > 0 else { return data }
         guard let newline = data.firstIndex(of: 0x0A) else { return Data() }
         return Data(data.suffix(from: data.index(after: newline)))
+    }
+
+    private func readIncrementalData(from url: URL, offset: Int64) -> Data? {
+        guard offset >= 0,
+              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd(),
+              end >= UInt64(offset),
+              (try? handle.seek(toOffset: UInt64(offset))) != nil else {
+            return nil
+        }
+        return try? handle.readToEnd()
     }
 
     private func sessionMetadata(from url: URL, fallbackID: String) -> SessionMetadata {
