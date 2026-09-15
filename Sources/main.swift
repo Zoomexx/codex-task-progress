@@ -218,6 +218,11 @@ private final class TaskReader {
     private let standardDateFormatter: ISO8601DateFormatter
     private var cache: [String: CachedTask] = [:]
     private var ignoredFiles: [String: (modifiedAt: Date, fileSize: Int64)] = [:]
+    // A log writer can append a JSON line while the 4-second refresh is
+    // reading. Keep an incomplete trailing fragment and prepend it to the
+    // next increment; otherwise a pending approval call could be skipped
+    // forever when its line is split at the read boundary.
+    private var partialLines: [String: Data] = [:]
     private var threadNames: [String: String] = [:]
     private var sessionIndexModifiedAt: Date?
     private let approvalGraceInterval: TimeInterval = 8
@@ -274,6 +279,7 @@ private final class TaskReader {
 
         cache = cache.filter { seenPaths.contains($0.key) }
         ignoredFiles = ignoredFiles.filter { seenPaths.contains($0.key) }
+        partialLines = partialLines.filter { seenPaths.contains($0.key) }
         let allTasks = Array(tasksByID.values)
         latestCumulativeTokenTotal = cumulativeTokenTotal(from: allTasks)
         var tasks = allTasks
@@ -315,9 +321,18 @@ private final class TaskReader {
             // for everything before that offset.
             let data: Data
             if fileSize > cached.fileSize {
-                data = (readIncrementalData(from: url, offset: cached.fileSize)
-                    ?? readTailData(from: url, maxBytes: 1_048_576)) ?? Data()
+                if let increment = readIncrementalData(from: url, offset: cached.fileSize) {
+                    let previousFragment = partialLines[url.path] ?? Data()
+                    data = completeLines(
+                        in: previousFragment + increment,
+                        for: url.path
+                    )
+                } else {
+                    partialLines[url.path] = nil
+                    data = readTailData(from: url, maxBytes: 1_048_576) ?? Data()
+                }
             } else {
+                partialLines[url.path] = nil
                 data = readTailData(from: url, maxBytes: 1_048_576) ?? Data()
             }
             let task = taskFromTail(
@@ -335,12 +350,14 @@ private final class TaskReader {
         // refreshes consume only bytes appended after the cached file offset.
         // Small logs retain the exact full-parse path below.
         if fileSize >= 1_048_576 {
+            partialLines[url.path] = nil
             guard let task = taskFromRecentTail(url: url, modifiedAt: modifiedAt, fileSize: fileSize) else {
                 return nil
             }
             cache[url.path] = CachedTask(modifiedAt: modifiedAt, fileSize: fileSize, task: task)
             return task
         }
+        partialLines[url.path] = nil
         guard let data = try? Data(contentsOf: url),
               let text = String(data: data, encoding: .utf8) else {
             return nil
@@ -507,11 +524,16 @@ private final class TaskReader {
             effectiveStart = latestStart ?? firstUserDate ?? firstEventDate ?? latestActivity
         }
         let effectiveFinish = isActive ? nil : terminalDate
-        let approval = isActive ? approvalState(
+        // An unresolved approval call is itself evidence that the turn is
+        // waiting, even when the surrounding log has a stale terminal marker
+        // (long sessions can append the new call before the next
+        // task_started event is visible in the tail). Do not hide the signal
+        // behind the derived running/waiting status.
+        let approval = approvalState(
             pendingToolCalls: pendingToolCalls,
             latestApprovalEvent: latestApprovalEvent,
             now: Date()
-        ) : nil
+        )
         let indexedTitle = threadNames[sessionID] ?? (parentThreadID.flatMap { threadNames[$0] })
         let title = cleanTitle(indexedTitle ?? latestUserText ?? firstUserText ?? "未命名任务")
         let project = cwd.isEmpty ? "当前工作区" : URL(fileURLWithPath: cwd).lastPathComponent
@@ -655,7 +677,7 @@ private final class TaskReader {
         if cached.needsApproval {
             latestApprovalEvent = PendingToolCall(
                 requestedAt: cached.approvalSince ?? cached.lastActivity,
-                detail: cached.approvalDetail ?? "需要授权/批准",
+                detail: cached.approvalDetail ?? "待批准",
                 isExplicit: true,
                 toolName: ""
             )
@@ -819,11 +841,15 @@ private final class TaskReader {
                 ?? latestActivity
         }
         let effectiveFinish = isActive ? nil : latestTerminal
-        let approval = isActive ? approvalState(
+        // Keep an unresolved approval visible even if a long-log tail still
+        // carries an older terminal marker. The pending call is the stronger
+        // signal and will be removed only by its matching output or a terminal
+        // turn event.
+        let approval = approvalState(
             pendingToolCalls: pendingToolCalls,
             latestApprovalEvent: latestApprovalEvent,
             now: Date()
-        ) : nil
+        )
         return TaskProgress(
             id: cached.id,
             title: threadNames[cached.id] ?? cached.title,
@@ -863,7 +889,7 @@ private final class TaskReader {
             if isApprovalEventType(payloadType) {
                 latestApprovalEvent = PendingToolCall(
                     requestedAt: date,
-                    detail: "等待你的授权/批准",
+                    detail: "待批准",
                     isExplicit: true,
                     toolName: payloadType
                 )
@@ -923,15 +949,16 @@ private final class TaskReader {
     private func approvalCandidate(from payload: [String: Any], date: Date) -> PendingToolCall? {
         let toolName = (payload["name"] as? String) ?? (payload["type"] as? String) ?? "工具"
         let explicit = hasExplicitApprovalSignal(in: payload)
+        let interactivePayload = ApprovalDetection.isInteractivePayload(payload)
         // Shell calls can be long-running without needing approval. For browser
         // and computer-use calls there is no reliable status field while the
         // app's approval card is open, so allow the grace-period fallback only
         // for those interactive surfaces.
-        let graceEligible = isInteractiveApprovalTool(toolName)
+        let graceEligible = ApprovalDetection.isInteractiveTool(toolName) || interactivePayload
         guard explicit || graceEligible else { return nil }
         return PendingToolCall(
             requestedAt: date,
-            detail: approvalDetail(for: toolName),
+            detail: ApprovalDetection.detail(for: toolName, interactivePayload: interactivePayload),
             isExplicit: explicit,
             toolName: toolName
         )
@@ -998,28 +1025,6 @@ private final class TaskReader {
         ].contains { serialized.contains($0) }
     }
 
-    private func isInteractiveApprovalTool(_ toolName: String) -> Bool {
-        let normalized = toolName.lowercased()
-        return normalized.contains("browser")
-            || normalized.contains("chrome")
-            || normalized.contains("computer")
-            || normalized.contains("node_repl")
-    }
-
-    private func approvalDetail(for toolName: String) -> String {
-        let normalized = toolName.lowercased()
-        if normalized.contains("browser") || normalized.contains("chrome") || normalized.contains("web") {
-            return "等待批准浏览器操作"
-        }
-        if normalized.contains("computer") || normalized.contains("node_repl") {
-            return "等待批准软件操作"
-        }
-        if normalized == "exec" || normalized.contains("exec") || normalized.contains("apply_patch") {
-            return "等待授权执行本机操作"
-        }
-        return "等待你的授权/批准"
-    }
-
     private func serializedPayload(_ payload: [String: Any]) -> String {
         guard JSONSerialization.isValidJSONObject(payload),
               let data = try? JSONSerialization.data(withJSONObject: payload),
@@ -1051,6 +1056,20 @@ private final class TaskReader {
             return nil
         }
         return try? handle.readToEnd()
+    }
+
+    private func completeLines(in data: Data, for path: String) -> Data {
+        guard let newline = data.lastIndex(of: 0x0A) else {
+            partialLines[path] = data
+            return Data()
+        }
+        let completeEnd = data.index(after: newline)
+        if completeEnd < data.endIndex {
+            partialLines[path] = Data(data[completeEnd...])
+        } else {
+            partialLines[path] = nil
+        }
+        return Data(data[..<completeEnd])
     }
 
     private func sessionMetadata(from url: URL, fallbackID: String) -> SessionMetadata {
@@ -1154,7 +1173,7 @@ private final class TaskReader {
         case "FileChange": return "修改文件"
         case "Reasoning": return "思考中"
         case "ContextCompaction": return "整理上下文"
-        case "approval_request", "exec_approval_request", "authorization_request", "permission_request", "elicitation": return "需要授权/批准"
+        case "approval_request", "exec_approval_request", "authorization_request", "permission_request", "elicitation": return "待批准"
         case "task_started": return "任务开始"
         case "task_complete": return "任务完成"
         case "turn_aborted": return "任务中断"
@@ -1454,6 +1473,9 @@ private final class TaskPanelView: NSView {
     var onShowMore: ((String, [TaskProgress]) -> Void)?
     var onHover: ((Bool) -> Void)?
     private var hitRows: [HitRow] = []
+    // Defer navigation until the matching mouse-up. A hover, a first-button
+    // activation, or a drag across a row must never open a Codex conversation.
+    private var pendingHitRow: HitRow?
 
     // The board intentionally keeps one representative row per section. The
     // remaining rows open in the detail popover, so the card can stay airy
@@ -1461,7 +1483,10 @@ private final class TaskPanelView: NSView {
     private let rowHeight: CGFloat = 46
     private let sectionHeaderHeight: CGFloat = 21
     private let sectionBottomSpacing: CGFloat = 7
-    private let approvalBannerHeight: CGFloat = 36
+    // When the approval banner appears, reclaim the unused title-to-content
+    // gap so the card keeps its compact height instead of pushing both
+    // sections downward and re-anchoring the window.
+    private let approvalBannerHeight: CGFloat = 32
     private let headerHeight: CGFloat = 46
     private let activityView: TaskActivityView
 
@@ -1483,9 +1508,10 @@ private final class TaskPanelView: NSView {
     var preferredHeight: CGFloat {
         let active = tasks.filter { $0.status == .running || $0.status == .waiting }
         let finished = tasks.filter { $0.status != .running && $0.status != .waiting }
-        var contentHeight: CGFloat = headerHeight
-        if tasks.contains(where: \.needsApproval) {
-            contentHeight += approvalBannerHeight + 6
+        let hasApproval = tasks.contains(where: \.needsApproval)
+        var contentHeight: CGFloat = hasApproval ? compactApprovalHeaderHeight : headerHeight
+        if hasApproval {
+            contentHeight += approvalBannerHeight
         }
         for count in [active.count, finished.count] {
             let visibleRows = count == 0 ? 1 : 1
@@ -1549,10 +1575,10 @@ private final class TaskPanelView: NSView {
         let active = sortedTasks(statuses: [.running, .waiting])
         let finished = sortedTasks(statuses: [.completed, .interrupted, .idle])
         hitRows = []
-        var y: CGFloat = headerHeight
+        let hasApproval = tasks.contains(where: \.needsApproval)
+        var y: CGFloat = hasApproval ? compactApprovalHeaderHeight : headerHeight
         let approvalCount = tasks.filter(\.needsApproval).count
         if approvalCount > 0 {
-            y += 6
             drawApprovalBanner(count: approvalCount, y: &y)
         }
         drawSection("进行中", tasks: active, y: &y)
@@ -1587,9 +1613,10 @@ private final class TaskPanelView: NSView {
     }
 
     private func estimatedContentBottom() -> CGFloat {
-        var height = headerHeight
+        let hasApproval = tasks.contains(where: \.needsApproval)
+        var height = hasApproval ? compactApprovalHeaderHeight : headerHeight
         if tasks.contains(where: \.needsApproval) {
-            height += 6 + approvalBannerHeight
+            height += approvalBannerHeight
         }
         // drawSection always renders one row (or one empty row), followed by
         // the same compact bottom spacing. Keep the animation below that
@@ -1600,13 +1627,24 @@ private final class TaskPanelView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        if let match = hitRows.first(where: { $0.frame.contains(point) }) {
-            if let task = match.task {
-                onSelect?(task)
-            } else if let title = match.moreTitle {
-                onShowMore?(title, match.moreTasks)
-            }
+        pendingHitRow = hitRows.first(where: { $0.frame.contains(point) })
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let match = pendingHitRow else { return }
+        pendingHitRow = nil
+        let point = convert(event.locationInWindow, from: nil)
+        guard match.frame.contains(point) else { return }
+        if let task = match.task {
+            onSelect?(task)
+        } else if let title = match.moreTitle {
+            onShowMore?(title, match.moreTasks)
         }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        // A drag is window movement, not a task click.
+        pendingHitRow = nil
     }
 
     private func drawSection(_ title: String, tasks: [TaskProgress], y: inout CGFloat) {
@@ -1682,7 +1720,7 @@ private final class TaskPanelView: NSView {
     }
 
     private func drawApprovalBanner(count: Int, y: inout CGFloat) {
-        let text = count == 1 ? "需要授权 / 批准" : "需要授权 / 批准 · \(count) 项"
+        let text = count == 1 ? "待批准" : "待批准 · \(count) 项"
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 9.2, weight: .semibold),
             .foregroundColor: NSColor.systemOrange
@@ -1696,6 +1734,8 @@ private final class TaskPanelView: NSView {
         drawText(text, in: NSRect(x: 34, y: y + 11, width: bounds.width - 58, height: 14), attributes: attributes)
         y += approvalBannerHeight
     }
+
+    private var compactApprovalHeaderHeight: CGFloat { 38 }
 
     private func drawTaskBackground(at y: CGFloat, status: TaskStatus, highlighted: Bool) {
         status.color.withAlphaComponent(highlighted ? 0.48 : 0.28).setFill()
@@ -1741,7 +1781,7 @@ private final class TaskPanelView: NSView {
             parts.append("本轮消耗约 \(formatApproxTokenCount(usage.total)) tokens")
         }
         if task.needsApproval {
-            parts.append(task.approvalDetail ?? "需要授权/批准")
+            parts.append(task.approvalDetail ?? "待批准")
         } else if !task.detail.isEmpty {
             parts.append(task.detail)
         }
@@ -1815,6 +1855,7 @@ private final class TaskDetailView: NSView {
     /// total.
     var cumulativeTokenTotal: Int?
     private var hitRows: [(frame: NSRect, task: TaskProgress)] = []
+    private var pendingHitRow: (frame: NSRect, task: TaskProgress)?
     private let rowHeight: CGFloat = 64
 
     override var isFlipped: Bool { true }
@@ -1849,7 +1890,7 @@ private final class TaskDetailView: NSView {
         drawText(sectionTitle, in: NSRect(x: 17, y: 32, width: bounds.width - 34, height: 22), attributes: headerAttributes)
         let approvalCount = tasks.filter(\.needsApproval).count
         let subtitle = approvalCount > 0
-            ? "\(tasks.count) 项 · 待授权/批准 \(approvalCount)"
+            ? "\(tasks.count) 项 · 待批准 \(approvalCount)"
             : "\(tasks.count) 项 · 点击任务可打开对应会话"
         let subtitleAttributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 9.3, weight: .regular),
@@ -1913,9 +1954,19 @@ private final class TaskDetailView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        if let match = hitRows.first(where: { $0.frame.contains(point) }) {
-            onSelect?(match.task)
-        }
+        pendingHitRow = hitRows.first(where: { $0.frame.contains(point) })
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let match = pendingHitRow else { return }
+        pendingHitRow = nil
+        let point = convert(event.locationInWindow, from: nil)
+        guard match.frame.contains(point) else { return }
+        onSelect?(match.task)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        pendingHitRow = nil
     }
 
     private func cumulativeTokenTotalFromVisibleLogs() -> Int {
@@ -1954,7 +2005,7 @@ private final class TaskDetailView: NSView {
             parts.append("本轮消耗约 \(formatApproxTokenCount(usage.total)) tokens")
         }
         if task.needsApproval {
-            parts.append(task.approvalDetail ?? "需要授权/批准")
+            parts.append(task.approvalDetail ?? "待批准")
         } else if !task.detail.isEmpty {
             parts.append(task.detail)
         }
@@ -2406,7 +2457,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         ]
         let approvalCount = latestTasks.filter(\.needsApproval).count
-        let prefix = approvalCount > 0 ? "⚠ " : ""
+        let prefix = approvalCount > 0 ? "! " : ""
         let result = NSMutableAttributedString(string: "\(prefix)Codex ", attributes: baseAttributes)
         appendRemainingSegment(
             to: result,
@@ -2449,7 +2500,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let seven = remainingPercent(for: displayWindow(snapshot.sevenDay, status: snapshot.status)).map { "\(formatPercent($0))%" } ?? "暂无数据"
         let active = latestTasks.filter { $0.status == .running || $0.status == .waiting }.count
         let approvals = latestTasks.filter(\.needsApproval).count
-        let approvalText = approvals > 0 ? "；\(approvals) 个任务需要授权/批准" : ""
+        let approvalText = approvals > 0 ? "；\(approvals) 个任务待批准" : ""
         return "Codex 剩余用量：5 小时 \(five)，7 天 \(seven)；\(snapshot.status.displayName)；\(active) 个活跃任务\(approvalText)"
     }
 
@@ -2467,7 +2518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let approvalCount = latestTasks.filter(\.needsApproval).count
         if approvalCount > 0 {
             let approvalItem = NSMenuItem(
-                title: "⚠ 需要授权/批准：\(approvalCount) 个",
+                title: "! 待批准：\(approvalCount) 个",
                 action: nil,
                 keyEquivalent: ""
             )
