@@ -188,11 +188,24 @@ private struct TaskProgress {
     }
 }
 
+private func isActiveTask(_ task: TaskProgress) -> Bool {
+    task.needsApproval || task.status == .running || task.status == .waiting
+}
+
+private func taskDisplayPrecedes(_ lhs: TaskProgress, _ rhs: TaskProgress) -> Bool {
+    if lhs.needsApproval != rhs.needsApproval {
+        return lhs.needsApproval
+    }
+    return lhs.lastActivity > rhs.lastActivity
+}
+
 private struct PendingToolCall {
     let requestedAt: Date
     let detail: String
     let isExplicit: Bool
+    let isInteractive: Bool
     let toolName: String
+    let callID: String?
 }
 
 private struct CachedTask {
@@ -284,7 +297,10 @@ private final class TaskReader {
         latestCumulativeTokenTotal = cumulativeTokenTotal(from: allTasks)
         var tasks = allTasks
         tasks.sort {
-            statusPriority($0.status) != statusPriority($1.status)
+            if $0.needsApproval != $1.needsApproval {
+                return $0.needsApproval
+            }
+            return statusPriority($0.status) != statusPriority($1.status)
                 ? statusPriority($0.status) < statusPriority($1.status)
                 : $0.lastActivity > $1.lastActivity
         }
@@ -679,7 +695,9 @@ private final class TaskReader {
                 requestedAt: cached.approvalSince ?? cached.lastActivity,
                 detail: cached.approvalDetail ?? "待批准",
                 isExplicit: true,
-                toolName: ""
+                isInteractive: false,
+                toolName: "",
+                callID: nil
             )
         }
         if let completed = cached.completedSteps, let total = cached.totalSteps {
@@ -891,7 +909,9 @@ private final class TaskReader {
                     requestedAt: date,
                     detail: "待批准",
                     isExplicit: true,
-                    toolName: payloadType
+                    isInteractive: false,
+                    toolName: payloadType,
+                    callID: callIdentifier(from: payload)
                 )
             } else if payloadType == "task_complete" || payloadType == "turn_aborted" {
                 pendingToolCalls.removeAll()
@@ -908,10 +928,13 @@ private final class TaskReader {
         if isToolOutputType(payloadType) {
             if let callID = callIdentifier(from: payload) {
                 pendingToolCalls.removeValue(forKey: callID)
+                if latestApprovalEvent?.callID == callID
+                    || (latestApprovalEvent?.callID == nil && pendingToolCalls.isEmpty) {
+                    latestApprovalEvent = nil
+                }
             }
-            // An output means the tool call was resolved. If an approval event
-            // was emitted separately, it is resolved by the same output.
-            latestApprovalEvent = nil
+            // Only the matching call may resolve an approval. An unrelated
+            // parallel tool output must not hide another pending prompt.
             return
         }
 
@@ -942,7 +965,18 @@ private final class TaskReader {
             return latestApprovalEvent
         }
         return pendingToolCalls.values
-            .filter { $0.isExplicit || now.timeIntervalSince($0.requestedAt) >= approvalGraceInterval }
+            .filter {
+                if $0.isExplicit { return true }
+                // The four-second reader refresh should surface a CUA prompt
+                // on its next pass. Keep ordinary interactive calls quiet for
+                // a short grace window so completed browser work does not
+                // flash as approval, while avoiding the old eight-second
+                // delay that made a real prompt look missing.
+                let grace = $0.isInteractive
+                    ? min(approvalGraceInterval, 2)
+                    : approvalGraceInterval
+                return now.timeIntervalSince($0.requestedAt) >= grace
+            }
             .min { $0.requestedAt < $1.requestedAt }
     }
 
@@ -960,7 +994,9 @@ private final class TaskReader {
             requestedAt: date,
             detail: ApprovalDetection.detail(for: toolName, interactivePayload: interactivePayload),
             isExplicit: explicit,
-            toolName: toolName
+            isInteractive: interactivePayload,
+            toolName: toolName,
+            callID: callIdentifier(from: payload)
         )
     }
 
@@ -1506,8 +1542,8 @@ private final class TaskPanelView: NSView {
     }
 
     var preferredHeight: CGFloat {
-        let active = tasks.filter { $0.status == .running || $0.status == .waiting }
-        let finished = tasks.filter { $0.status != .running && $0.status != .waiting }
+        let active = tasks.filter(isActiveTask)
+        let finished = tasks.filter { !isActiveTask($0) }
         let hasApproval = tasks.contains(where: \.needsApproval)
         var contentHeight: CGFloat = hasApproval ? compactApprovalHeaderHeight : headerHeight
         if hasApproval {
@@ -1572,8 +1608,8 @@ private final class TaskPanelView: NSView {
         ]
         drawText("任务进度", in: NSRect(x: 15, y: 16, width: bounds.width - 30, height: 22), attributes: titleAttributes)
 
-        let active = sortedTasks(statuses: [.running, .waiting])
-        let finished = sortedTasks(statuses: [.completed, .interrupted, .idle])
+        let active = tasks.filter(isActiveTask).sorted(by: taskDisplayPrecedes)
+        let finished = tasks.filter { !isActiveTask($0) }.sorted(by: taskDisplayPrecedes)
         hitRows = []
         let hasApproval = tasks.contains(where: \.needsApproval)
         var y: CGFloat = hasApproval ? compactApprovalHeaderHeight : headerHeight
@@ -1592,7 +1628,7 @@ private final class TaskPanelView: NSView {
     }
 
     private func updateActivityView() {
-        let activeTasks = sortedTasks(statuses: [.running, .waiting])
+        let activeTasks = tasks.filter(isActiveTask).sorted(by: taskDisplayPrecedes)
         // The section renderer adds a small trailing gap after the last row.
         // Start the centering calculation at the row's actual lower edge so
         // the indicator sits in the visual middle of the remaining whitespace
@@ -1769,7 +1805,7 @@ private final class TaskPanelView: NSView {
     }
 
     private func detailText(for task: TaskProgress) -> String {
-        let isActive = task.status == .running || task.status == .waiting
+        let isActive = isActiveTask(task)
         var parts: [String] = []
         if isActive {
             parts.append("已处理\(formatActiveElapsed(task.elapsed))")
@@ -1796,12 +1832,6 @@ private final class TaskPanelView: NSView {
         if abs(frame.height - requiredHeight) > 0.5 {
             setFrameSize(NSSize(width: frame.width, height: requiredHeight))
         }
-    }
-
-    private func sortedTasks(statuses: [TaskStatus]) -> [TaskProgress] {
-        tasks
-            .filter { task in statuses.contains { $0 == task.status } }
-            .sorted { $0.lastActivity > $1.lastActivity }
     }
 
     private func drawText(_ value: String, in rect: NSRect, attributes: [NSAttributedString.Key: Any]) {
@@ -1993,7 +2023,7 @@ private final class TaskDetailView: NSView {
     }
 
     private func detailText(for task: TaskProgress) -> String {
-        let isActive = task.status == .running || task.status == .waiting
+        let isActive = isActiveTask(task)
         var parts: [String] = []
         if isActive {
             parts.append("已处理\(formatActiveElapsed(task.elapsed))")
@@ -2250,11 +2280,11 @@ private final class TaskPanelController: NSWindowController {
             keepPanelOnVisibleScreen(window)
         }
         let active = tasks
-            .filter { $0.status == .running || $0.status == .waiting }
-            .sorted { $0.lastActivity > $1.lastActivity }
+            .filter(isActiveTask)
+            .sorted(by: taskDisplayPrecedes)
         let finished = tasks
-            .filter { $0.status != .running && $0.status != .waiting }
-            .sorted { $0.lastActivity > $1.lastActivity }
+            .filter { !isActiveTask($0) }
+            .sorted(by: taskDisplayPrecedes)
         updateDetailWindow(named: "进行中", tasks: Array(active.dropFirst()), cumulativeTokenTotal: latestCumulativeTokenTotal)
         updateDetailWindow(named: "已完成", tasks: Array(finished.dropFirst()), cumulativeTokenTotal: latestCumulativeTokenTotal)
     }
@@ -2498,7 +2528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func tooltip(for snapshot: UsageSnapshot) -> String {
         let five = remainingPercent(for: displayWindow(snapshot.fiveHour, status: snapshot.status)).map { "\(formatPercent($0))%" } ?? "暂无数据"
         let seven = remainingPercent(for: displayWindow(snapshot.sevenDay, status: snapshot.status)).map { "\(formatPercent($0))%" } ?? "暂无数据"
-        let active = latestTasks.filter { $0.status == .running || $0.status == .waiting }.count
+        let active = latestTasks.filter(isActiveTask).count
         let approvals = latestTasks.filter(\.needsApproval).count
         let approvalText = approvals > 0 ? "；\(approvals) 个任务待批准" : ""
         return "Codex 剩余用量：5 小时 \(five)，7 天 \(seven)；\(snapshot.status.displayName)；\(active) 个活跃任务\(approvalText)"
