@@ -10,6 +10,7 @@ trap 'rm -rf "$module_cache"' EXIT
 
 mkdir -p "$macos_dir"
 swiftc \
+  "$project_dir/Sources/ApprovalDetection.swift" \
   "$project_dir/Sources/UsageSnapshot.swift" \
   "$project_dir/Sources/OfficialUsageClient.swift" \
   "$project_dir/Sources/UsageSyncService.swift" \
@@ -34,9 +35,9 @@ cat > "$contents_dir/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.4.2</string>
+    <string>0.4.3</string>
     <key>CFBundleVersion</key>
-    <string>6</string>
+    <string>7</string>
     <key>LSUIElement</key>
     <true/>
 </dict>
